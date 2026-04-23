@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+#
+# vim: fen fdm=indent syntax=off rnu:
+#
+# Written By:
+#   Woland
+# GitHub:
+#   https://github.com/wolandark
+#
+# Usage:
+#   claude-resume [initial-query]
+#   claude-resume --here
+#
+# Requires: jq, fzf, claude.
+#
+# Hint:
+# You Can Bind A Key In Your Shell
+# To Launch This Script Once It Is
+# In Your $PATH
+#
+# Bash Shell:
+#   bind -x '"\er": "claude-resume"'
+#   Then Alt+R To Start The Fuzzy Picker
+#
+# Good Old-Fashioned Scripting BTW
+# Believe It Or Not Some Of Us Still
+# Like it!
+#
+
+set -euo pipefail
+
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+SELF="$(realpath "$0")"
+
+EnsureFzf() {
+    command -v fzf >/dev/null 2>&1 && return
+    echo "fzf not found — installing to ~/.fzf" >&2
+    command -v git >/dev/null 2>&1 || {
+        echo "error: git is required to install fzf" >&2
+        exit 1
+    }
+    if [[ ! -d $HOME/.fzf ]]; then
+        git clone --depth 1 https://github.com/junegunn/fzf.git "$HOME/.fzf" >&2
+    fi
+    yes | "$HOME/.fzf/install" >&2
+    local rc
+    case "${SHELL:-}" in
+    *zsh) rc=$HOME/.zshrc ;;
+    *) rc=$HOME/.bashrc ;;
+    esac
+    # shellcheck disable=SC1090 # Retarded Warning Anyway
+    [[ -f $rc ]] && source "$rc" || true
+    # Subshell Sourcing Of An RC With An Interactive-Only Guard Won't Update PATH,
+    [[ -d $HOME/.fzf/bin ]] && export PATH="$HOME/.fzf/bin:$PATH"
+    command -v fzf >/dev/null 2>&1 || {
+        echo "error: fzf still not on PATH after install" >&2
+        exit 1
+    }
+}
+
+ExtractTopic() {
+    jq -r '
+    select(.type=="user"
+      and (.message.content | type) == "string"
+      and (.message.content | startswith("<command-") | not)
+      and (.message.content | startswith("<local-command-") | not)
+    ) | .message.content
+  ' "$1" 2>/dev/null |
+        awk 'NF' |
+        head -1 |
+        tr '\n\r\t' '   ' |
+        cut -c1-140
+}
+
+ExtractCwd() {
+    local path=$1 cwd
+    cwd=$(grep -m1 -oE '"cwd":"[^"]*"' "$path" | sed 's/^"cwd":"//;s/"$//') || true
+    if [[ -z ${cwd:-} ]]; then
+        cwd=$(basename "$(dirname "$path")" | sed 's|-|/|g')
+    fi
+    printf '%s' "$cwd"
+}
+
+BuildIndex() {
+    local filter_cwd=${1:-}
+    find "$PROJECTS_DIR" -mindepth 2 -maxdepth 2 -name '*.jsonl' -type f -printf '%T@\t%p\n' |
+        sort -rn |
+        while IFS=$'\t' read -r mtime path; do
+            local id cwd topic date
+            id=$(basename "$path" .jsonl)
+            cwd=$(ExtractCwd "$path")
+            [[ -n $filter_cwd && $cwd != "$filter_cwd" ]] && continue
+            topic=$(ExtractTopic "$path")
+            [[ -z $topic ]] && topic='(no user messages)'
+            date=$(date -d "@${mtime%.*}" '+%Y-%m-%d %H:%M')
+            printf '%s\t%s\t%s\t%s\t%s\n' "$date" "$id" "$cwd" "$topic" "$path"
+        done
+}
+
+Preview() {
+    local path=$1
+    printf 'session: %s\ncwd:     %s\n\n--- first user messages ---\n' \
+        "$(basename "$path" .jsonl)" "$(ExtractCwd "$path")"
+    jq -r '
+    select(.type=="user"
+      and (.message.content | type) == "string"
+      and (.message.content | startswith("<command-") | not)
+      and (.message.content | startswith("<local-command-") | not)
+    ) | "• " + .message.content
+  ' "$path" 2>/dev/null | head -40
+}
+
+Main() {
+    local filter_cwd='' query=''
+    while (($#)); do
+        case $1 in
+        --here) filter_cwd=$PWD ;;
+        -h | --help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) query=$1 ;;
+        esac
+        shift
+    done
+
+    EnsureFzf
+
+    local sel
+    sel=$(BuildIndex "$filter_cwd" | fzf \
+        --delimiter=$'\t' \
+        --with-nth=1,3,4 \
+        --nth=3,4 \
+        --query="$query" \
+        --no-sort \
+        --ansi \
+        --header='fuzzy-match on cwd + topic — enter to resume' \
+        --preview="'$SELF' --preview {5}" \
+        --preview-window='right,55%,wrap') || exit 130
+
+    local id cwd
+    IFS=$'\t' read -r _ id cwd _ _ <<<"$sel"
+
+    if [[ -d $cwd ]]; then
+        cd "$cwd"
+    else
+        echo "warning: cwd '$cwd' no longer exists; resuming from $PWD" >&2
+    fi
+    echo "resuming $id in $PWD" >&2
+    exec claude -r "$id"
+}
+
+if [[ ${1:-} == --preview ]]; then
+    Preview "$2"
+    exit 0
+fi
+
+Main "$@"
